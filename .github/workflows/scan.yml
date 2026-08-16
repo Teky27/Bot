@@ -1,1 +1,30 @@
+name: RSI Scanner (Alpaca)
 
+on:
+  schedule:
+    # Every 15 minutes, Monday–Friday only (day-of-week field: 1-5).
+    # This alone doesn't know about market holidays — the script's own
+    # market-clock check (see rsi_scanner.py) handles those.
+    - cron: "*/15 * * * 1-5"
+  workflow_dispatch: {}       # lets you click "Run workflow" manually to test
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scanner
+        env:
+          ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+          ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+        run: python rsi_scanner.py
