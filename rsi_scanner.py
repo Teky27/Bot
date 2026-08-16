@@ -82,7 +82,7 @@ HEADERS = {
 # Alpaca tickers are plain symbols, no exchange suffix — and the same symbol
 # generally works for both Alpaca and Yahoo Finance, so no separate mapping
 # is needed here (unlike the Trading 212 version).
-WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVD", "IGLN", "GOOGL", "GOOG", "AMZN", "VUAA", "META", "EUNL", "EQQQ"]
+WATCHLIST = ["AAPL", "MSFT", "TSLA"]
 
 RSI_PERIOD = 14
 RSI_BUY_THRESHOLD = 30
@@ -120,6 +120,15 @@ def verify_paper_environment():
         f"Confirm this matches your PAPER account in the Alpaca dashboard "
         f"before trusting this run."
     )
+
+
+def market_is_open() -> bool:
+    """Checks Alpaca's market clock. Catches weekends AND holidays, unlike
+    a plain weekday cron schedule."""
+    r = requests.get(f"{BASE_URL}/v2/clock", headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    clock = r.json()
+    return bool(clock.get("is_open"))
 
 # ---------------------------------------------------------------------------
 # RSI
@@ -208,6 +217,10 @@ def wait_for_fill(order_id, timeout_seconds=60, poll_every=3):
 # ---------------------------------------------------------------------------
 def run_scan():
     verify_paper_environment()
+
+    if not market_is_open():
+        log.info("Market is currently closed (weekend or holiday) — skipping this run.")
+        return
 
     log.info("Fetching current positions...")
     positions = get_open_positions()
