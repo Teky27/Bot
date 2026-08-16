@@ -82,7 +82,7 @@ HEADERS = {
 # Alpaca tickers are plain symbols, no exchange suffix — and the same symbol
 # generally works for both Alpaca and Yahoo Finance, so no separate mapping
 # is needed here (unlike the Trading 212 version).
-WATCHLIST = ["AAPL", "MSFT", "TSLA"]
+WATCHLIST = ["AAPL", "MSFT", "TSLA", "NVD", "IGLN", "GOOGL", "GOOG", "AMZN", "VUAA", "META", "EUNL", "EQQQ"]
 
 RSI_PERIOD = 14
 RSI_BUY_THRESHOLD = 30
