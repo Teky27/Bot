@@ -25,14 +25,14 @@ WHAT IT DOES
    buy for a fixed dollar amount (ORDER_VALUE_USD) using Alpaca's
    fractional "notional" order type — up to MAX_NEW_BUYS_PER_RUN per run,
    so a broad market selloff can't trigger dozens of buys in one go.
-4. On every run, checks your existing open positions and market-sells any
-   that have gained 3% or more. (Not a limit order placed right after
-   buying — Alpaca rejects limit orders on fractional quantities, so this
-   checks-and-sells on each run instead. See take_profit_on_open_positions.)
+4. On every run, checks your existing open positions: sells any that have
+   gained 3% or more (take profit), and sells any that have dropped 5% or
+   more (stop loss). Both use market orders, not limit orders placed right
+   after buying — Alpaca rejects limit orders on fractional quantities, so
+   this checks-and-exits on each run instead. See manage_open_positions.
 
 WHAT IT DOESN'T DO
 ------------------
-- No stop-loss. Only the 3% upside target is managed here.
 - No memory between runs beyond what's already visible in your account.
 - Not financial advice; this is a paper account for a reason.
 
@@ -90,7 +90,8 @@ HEADERS = {
 
 RSI_PERIOD = 14
 RSI_BUY_THRESHOLD = 30
-PROFIT_TARGET_PCT = 0.03
+PROFIT_TARGET_PCT = 0.03    # sell if a position is up 3% or more
+STOP_LOSS_PCT = 0.05        # sell if a position is down 5% or more
 
 # How much to spend per buy, in USD. Alpaca converts this into a fractional
 # share quantity for you via the "notional" order field.
@@ -238,34 +239,50 @@ def wait_for_fill(order_id, timeout_seconds=60, poll_every=3):
     return None
 
 
-def take_profit_on_open_positions(positions):
-    """Checks every currently open position; if its unrealized gain has
-    reached PROFIT_TARGET_PCT, sells the full position with a MARKET order.
+def manage_open_positions(positions):
+    """Checks every currently open position on each run and exits it with a
+    MARKET order (fractional-share safe, unlike limit orders) if either:
+      - unrealized gain has reached PROFIT_TARGET_PCT (take profit), or
+      - unrealized loss has reached STOP_LOSS_PCT (stop loss).
 
-    This replaces the original approach of placing a limit sell right after
-    buying — Alpaca rejects limit orders on fractional share quantities
-    (422 Unprocessable Entity), and our buys are fractional by design (see
-    ORDER_VALUE_USD). Market orders on fractional quantities work fine, so
-    instead we check for the target being hit on every run and market-sell
-    at that point. This does mean the actual sell can land slightly above
-    or below the exact 3% mark, depending on price movement between runs —
-    an unavoidable trade-off of checking hourly rather than watching
-    continuously.
+    Because this only checks once per run (hourly), an actual exit price
+    can land a bit past the exact target/stop level depending on how much
+    the price moved between runs — an unavoidable trade-off of periodic
+    checking vs. watching continuously.
     """
+    if not positions:
+        log.info("No open positions to check.")
+        return
+
+    sold_count = 0
     for p in positions:
         try:
             symbol = p.get("symbol")
             qty = p.get("qty")
             unrealized_plpc = float(p.get("unrealized_plpc", 0))
+
             if unrealized_plpc >= PROFIT_TARGET_PCT:
                 log.info(
                     f"{symbol}: up {unrealized_plpc * 100:.2f}% — hit "
-                    f"{PROFIT_TARGET_PCT * 100:.0f}% target, selling {qty} shares."
+                    f"{PROFIT_TARGET_PCT * 100:.0f}% profit target, selling {qty} shares."
                 )
                 place_market_sell(symbol, qty)
+                sold_count += 1
+            elif unrealized_plpc <= -STOP_LOSS_PCT:
+                log.info(
+                    f"{symbol}: down {unrealized_plpc * 100:.2f}% — hit "
+                    f"-{STOP_LOSS_PCT * 100:.0f}% stop loss, selling {qty} shares."
+                )
+                place_market_sell(symbol, qty)
+                sold_count += 1
         except Exception as e:
             log.exception(f"Error checking/selling position {p.get('symbol')}: {e}")
             continue
+
+    log.info(
+        f"Checked {len(positions)} open position(s): {sold_count} exited "
+        f"(profit target or stop loss), {len(positions) - sold_count} still open."
+    )
 
 # ---------------------------------------------------------------------------
 # MAIN SCAN — one pass through the watchlist, then exit.
@@ -281,8 +298,8 @@ def run_scan():
     positions = get_open_positions()
     held_symbols = {p.get("symbol") for p in positions}
 
-    log.info("Checking open positions for profit-target hits...")
-    take_profit_on_open_positions(positions)
+    log.info("Checking open positions for profit-target / stop-loss hits...")
+    manage_open_positions(positions)
 
     log.info("Fetching S&P 500 ticker list...")
     try:
