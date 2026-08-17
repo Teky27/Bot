@@ -25,7 +25,10 @@ WHAT IT DOES
    buy for a fixed dollar amount (ORDER_VALUE_USD) using Alpaca's
    fractional "notional" order type — up to MAX_NEW_BUYS_PER_RUN per run,
    so a broad market selloff can't trigger dozens of buys in one go.
-4. Once a buy fills, places a limit sell 3% above the fill price.
+4. On every run, checks your existing open positions and market-sells any
+   that have gained 3% or more. (Not a limit order placed right after
+   buying — Alpaca rejects limit orders on fractional quantities, so this
+   checks-and-sells on each run instead. See take_profit_on_open_positions.)
 
 WHAT IT DOESN'T DO
 ------------------
@@ -200,14 +203,13 @@ def place_market_buy_notional(symbol, usd_amount):
     return r.json()
 
 
-def place_limit_sell(symbol, qty, limit_price):
+def place_market_sell(symbol, qty):
     payload = {
         "symbol": symbol,
         "qty": str(qty),
         "side": "sell",
-        "type": "limit",
-        "time_in_force": "gtc",
-        "limit_price": str(round(limit_price, 2)),
+        "type": "market",
+        "time_in_force": "day",
     }
     r = requests.post(f"{BASE_URL}/v2/orders", headers=HEADERS, json=payload, timeout=10)
     r.raise_for_status()
@@ -235,6 +237,36 @@ def wait_for_fill(order_id, timeout_seconds=60, poll_every=3):
     log.warning(f"Order {order_id} did not fill within {timeout_seconds}s.")
     return None
 
+
+def take_profit_on_open_positions(positions):
+    """Checks every currently open position; if its unrealized gain has
+    reached PROFIT_TARGET_PCT, sells the full position with a MARKET order.
+
+    This replaces the original approach of placing a limit sell right after
+    buying — Alpaca rejects limit orders on fractional share quantities
+    (422 Unprocessable Entity), and our buys are fractional by design (see
+    ORDER_VALUE_USD). Market orders on fractional quantities work fine, so
+    instead we check for the target being hit on every run and market-sell
+    at that point. This does mean the actual sell can land slightly above
+    or below the exact 3% mark, depending on price movement between runs —
+    an unavoidable trade-off of checking hourly rather than watching
+    continuously.
+    """
+    for p in positions:
+        try:
+            symbol = p.get("symbol")
+            qty = p.get("qty")
+            unrealized_plpc = float(p.get("unrealized_plpc", 0))
+            if unrealized_plpc >= PROFIT_TARGET_PCT:
+                log.info(
+                    f"{symbol}: up {unrealized_plpc * 100:.2f}% — hit "
+                    f"{PROFIT_TARGET_PCT * 100:.0f}% target, selling {qty} shares."
+                )
+                place_market_sell(symbol, qty)
+        except Exception as e:
+            log.exception(f"Error checking/selling position {p.get('symbol')}: {e}")
+            continue
+
 # ---------------------------------------------------------------------------
 # MAIN SCAN — one pass through the watchlist, then exit.
 # ---------------------------------------------------------------------------
@@ -245,6 +277,13 @@ def run_scan():
         log.info("Market is currently closed (weekend or holiday) — skipping this run.")
         return
 
+    log.info("Fetching current positions...")
+    positions = get_open_positions()
+    held_symbols = {p.get("symbol") for p in positions}
+
+    log.info("Checking open positions for profit-target hits...")
+    take_profit_on_open_positions(positions)
+
     log.info("Fetching S&P 500 ticker list...")
     try:
         watchlist = get_sp500_tickers()
@@ -252,10 +291,6 @@ def run_scan():
         log.exception(f"Could not fetch S&P 500 list — aborting this run: {e}")
         return
     log.info(f"Scanning {len(watchlist)} tickers.")
-
-    log.info("Fetching current positions...")
-    positions = get_open_positions()
-    held_symbols = {p.get("symbol") for p in positions}
 
     log.info("Downloading price history in bulk (this can take a minute or two)...")
     try:
@@ -298,20 +333,11 @@ def run_scan():
                 continue
 
             filled = wait_for_fill(order_id)
-            if not filled:
-                continue
-
-            fill_price = filled.get("filled_avg_price")
-            filled_qty = filled.get("filled_qty")
-            if not fill_price or not filled_qty:
-                log.warning("  Filled, but couldn't read fill price/qty — check the dashboard.")
-                continue
-
-            fill_price = float(fill_price)
-            target_price = fill_price * (1 + PROFIT_TARGET_PCT)
-            log.info(f"  Filled {filled_qty} @ {fill_price}. Placing limit sell at {target_price:.2f}.")
-            place_limit_sell(symbol, filled_qty, target_price)
-            log.info("  Profit-target order placed.")
+            if filled:
+                log.info(
+                    f"  Filled {filled.get('filled_qty')} @ {filled.get('filled_avg_price')}. "
+                    f"Profit target will be checked on future runs."
+                )
             buys_this_run += 1
 
         except Exception as e:
