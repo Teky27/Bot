@@ -16,15 +16,16 @@ equivalent to Trading 212's Demo. No terms conflict here.
 
 WHAT IT DOES
 ------------
-1. Downloads recent daily price history for each stock in WATCHLIST from
-   Yahoo Finance (kept from the original version — works fine alongside
-   Alpaca; Alpaca also has its own market data API if you'd rather
-   consolidate onto one provider later).
-2. Calculates 14-period RSI for each.
-3. If RSI < 30 and you don't already hold a position, places a market buy
-   for a fixed dollar amount (ORDER_VALUE_USD) using Alpaca's fractional
-   "notional" order type — no manual share-quantity math needed.
-4. Once that buy fills, places a limit sell 3% above the fill price.
+1. Fetches the current S&P 500 ticker list (from Wikipedia) instead of a
+   fixed hand-typed watchlist — so it scans ~500 stocks, not just a
+   handful you picked.
+2. Downloads recent daily price history for all of them in one batched
+   request from Yahoo Finance, and calculates 14-period RSI for each.
+3. For any stock at RSI < 30 that you don't already hold, places a market
+   buy for a fixed dollar amount (ORDER_VALUE_USD) using Alpaca's
+   fractional "notional" order type — up to MAX_NEW_BUYS_PER_RUN per run,
+   so a broad market selloff can't trigger dozens of buys in one go.
+4. Once a buy fills, places a limit sell 3% above the fill price.
 
 WHAT IT DOESN'T DO
 ------------------
@@ -80,9 +81,9 @@ HEADERS = {
 }
 
 # Alpaca tickers are plain symbols, no exchange suffix — and the same symbol
-# generally works for both Alpaca and Yahoo Finance, so no separate mapping
-# is needed here (unlike the Trading 212 version).
-WATCHLIST = ["AAPL", "MSFT", "TSLA"]
+# generally works for both Alpaca and Yahoo Finance.
+# The watchlist itself is now fetched dynamically at runtime (see
+# get_sp500_tickers below) instead of being hand-typed here.
 
 RSI_PERIOD = 14
 RSI_BUY_THRESHOLD = 30
@@ -91,6 +92,13 @@ PROFIT_TARGET_PCT = 0.03
 # How much to spend per buy, in USD. Alpaca converts this into a fractional
 # share quantity for you via the "notional" order field.
 ORDER_VALUE_USD = 20
+
+# Safety cap: with ~500 tickers being scanned, a broad market selloff could
+# push many of them below RSI 30 at once. This caps how many NEW positions
+# a single run is allowed to open, so one bad market day can't turn into
+# dozens of simultaneous buys. Extra candidates are simply skipped that run
+# and picked up again next run if still oversold.
+MAX_NEW_BUYS_PER_RUN = 5
 
 # ---------------------------------------------------------------------------
 # SAFETY CHECK — run before anything else, every single time.
@@ -144,12 +152,25 @@ def calculate_rsi(closes: pd.Series, period: int = RSI_PERIOD) -> float:
     return float(rsi.iloc[-1])
 
 
-def get_latest_rsi(symbol: str):
-    data = yf.download(symbol, period="3mo", interval="1d", progress=False)
-    if data.empty or len(data) < RSI_PERIOD + 1:
-        log.warning(f"Not enough price data for {symbol}, skipping.")
-        return None
-    return calculate_rsi(data["Close"])
+def get_sp500_tickers() -> list[str]:
+    """Fetches the current S&P 500 constituent list from Wikipedia."""
+    url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+    tables = pd.read_html(url)
+    tickers = tables[0]["Symbol"].tolist()
+    # A handful of tickers use a dot for share class (e.g. BRK.B, BF.B).
+    # Yahoo Finance and Alpaca don't always agree on how to format these,
+    # so we skip the ~5 affected names rather than risk a mismatched trade.
+    tickers = [t for t in tickers if "." not in t]
+    return tickers
+
+
+def get_price_history_bulk(tickers: list[str]) -> pd.DataFrame:
+    """One batched download for all tickers, instead of one request per
+    ticker — much friendlier to Yahoo Finance at this scale."""
+    return yf.download(
+        tickers, period="3mo", interval="1d",
+        group_by="ticker", threads=True, progress=False,
+    )
 
 # ---------------------------------------------------------------------------
 # ALPACA API HELPERS
@@ -158,10 +179,6 @@ def get_open_positions():
     r = requests.get(f"{BASE_URL}/v2/positions", headers=HEADERS, timeout=10)
     r.raise_for_status()
     return r.json()
-
-
-def already_holding(symbol, positions):
-    return any(p.get("symbol") == symbol for p in positions)
 
 
 def place_market_buy_notional(symbol, usd_amount):
@@ -222,27 +239,52 @@ def run_scan():
         log.info("Market is currently closed (weekend or holiday) — skipping this run.")
         return
 
+    log.info("Fetching S&P 500 ticker list...")
+    try:
+        watchlist = get_sp500_tickers()
+    except Exception as e:
+        log.exception(f"Could not fetch S&P 500 list — aborting this run: {e}")
+        return
+    log.info(f"Scanning {len(watchlist)} tickers.")
+
     log.info("Fetching current positions...")
     positions = get_open_positions()
+    held_symbols = {p.get("symbol") for p in positions}
 
-    for symbol in WATCHLIST:
+    log.info("Downloading price history in bulk (this can take a minute or two)...")
+    try:
+        history = get_price_history_bulk(watchlist)
+    except Exception as e:
+        log.exception(f"Bulk price download failed — aborting this run: {e}")
+        return
+
+    oversold_count = 0
+    buys_this_run = 0
+
+    for symbol in watchlist:
+        if buys_this_run >= MAX_NEW_BUYS_PER_RUN:
+            log.info(f"Reached MAX_NEW_BUYS_PER_RUN ({MAX_NEW_BUYS_PER_RUN}) — stopping scan for this run.")
+            break
+
         try:
-            log.info(f"Checking {symbol}...")
-
-            if already_holding(symbol, positions):
-                log.info("  Already holding a position — skipping.")
+            if symbol in held_symbols:
                 continue
 
-            rsi = get_latest_rsi(symbol)
-            if rsi is None:
-                continue
-            log.info(f"  RSI: {rsi:.2f}")
+            try:
+                closes = history[symbol]["Close"].dropna()
+            except (KeyError, ValueError):
+                continue  # Yahoo returned no data for this symbol this run
 
+            if len(closes) < RSI_PERIOD + 1:
+                continue
+
+            rsi = calculate_rsi(closes)
             if rsi >= RSI_BUY_THRESHOLD:
-                log.info("  Not oversold — no action.")
                 continue
 
-            log.info(f"  RSI below {RSI_BUY_THRESHOLD} — buying ${ORDER_VALUE_USD} worth.")
+            oversold_count += 1
+            log.info(f"{symbol}: RSI {rsi:.2f} — oversold, buying ${ORDER_VALUE_USD} worth.")
+
             buy_order = place_market_buy_notional(symbol, ORDER_VALUE_USD)
             order_id = buy_order.get("id")
             if order_id is None:
@@ -264,11 +306,14 @@ def run_scan():
             log.info(f"  Filled {filled_qty} @ {fill_price}. Placing limit sell at {target_price:.2f}.")
             place_limit_sell(symbol, filled_qty, target_price)
             log.info("  Profit-target order placed.")
+            buys_this_run += 1
 
         except Exception as e:
             # One bad ticker should never take down the whole scan.
-            log.exception(f"  Error processing {symbol}: {e}")
+            log.exception(f"Error processing {symbol}: {e}")
             continue
+
+    log.info(f"Scan finished. {oversold_count} oversold this run, {buys_this_run} new position(s) opened.")
 
 
 if __name__ == "__main__":
