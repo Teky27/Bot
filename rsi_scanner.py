@@ -21,10 +21,12 @@ WHAT IT DOES
    handful you picked.
 2. Downloads recent daily price history for all of them in one batched
    request from Yahoo Finance, and calculates 14-period RSI for each.
-3. For any stock at RSI < 30 that you don't already hold, places a market
-   buy for a fixed dollar amount (ORDER_VALUE_USD) using Alpaca's
-   fractional "notional" order type — up to MAX_NEW_BUYS_PER_RUN per run,
-   so a broad market selloff can't trigger dozens of buys in one go.
+3. For any stock at RSI < 30 that's also trading above its own 200-day
+   moving average (i.e. a dip within a longer uptrend, not a falling
+   knife) and that you don't already hold, places a market buy for a
+   fixed dollar amount (ORDER_VALUE_USD) — up to MAX_NEW_BUYS_PER_RUN new
+   positions per run, and never more than MAX_TOTAL_OPEN_POSITIONS open
+   at once across the whole account.
 4. On every run, checks your existing open positions: sells any that have
    gained 3% or more (take profit), and sells any that have dropped 5% or
    more (stop loss). Both use market orders, not limit orders placed right
@@ -104,6 +106,22 @@ ORDER_VALUE_USD = 20
 # and picked up again next run if still oversold.
 MAX_NEW_BUYS_PER_RUN = 5
 
+# Second, separate cap: total open positions across ALL runs, not just this
+# one. Without this, the bot could slowly accumulate 50+ open positions over
+# weeks as different stocks dip in and out of oversold territory, growing
+# your capital exposure well past what you intended. Once this many
+# positions are open, no new buys happen until some exit (via profit target
+# or stop loss) frees up a slot.
+MAX_TOTAL_OPEN_POSITIONS = 20
+
+# Trend filter: only buy a dip if the stock is still trading above its
+# longer-term trend (its TREND_SMA_PERIOD-day moving average). This is meant
+# to avoid "catching a falling knife" — buying RSI<30 in a stock that's in a
+# genuine structural decline, rather than a short-term dip within an
+# uptrend. Needs enough price history to compute, so the bulk download
+# window below was extended to cover it.
+TREND_SMA_PERIOD = 200
+
 # ---------------------------------------------------------------------------
 # SAFETY CHECK — run before anything else, every single time.
 # ---------------------------------------------------------------------------
@@ -176,11 +194,26 @@ def get_sp500_tickers() -> list[str]:
 
 def get_price_history_bulk(tickers: list[str]) -> pd.DataFrame:
     """One batched download for all tickers, instead of one request per
-    ticker — much friendlier to Yahoo Finance at this scale."""
+    ticker — much friendlier to Yahoo Finance at this scale. Uses a 1-year
+    window (not 3 months) so there's enough history for the 200-day trend
+    filter, not just RSI."""
     return yf.download(
-        tickers, period="3mo", interval="1d",
+        tickers, period="1y", interval="1d",
         group_by="ticker", threads=True, progress=False,
     )
+
+
+def passes_trend_filter(closes: pd.Series) -> bool:
+    """True if the stock is currently trading above its own
+    TREND_SMA_PERIOD-day moving average — i.e. this dip is happening within
+    a longer-term uptrend, not a structural decline. If there isn't enough
+    history to tell (e.g. a recently listed stock), we treat that as
+    'unknown' and skip it rather than buying blind."""
+    if len(closes) < TREND_SMA_PERIOD:
+        return False
+    sma = closes.rolling(TREND_SMA_PERIOD).mean().iloc[-1]
+    latest_close = closes.iloc[-1]
+    return bool(latest_close > sma)
 
 # ---------------------------------------------------------------------------
 # ALPACA API HELPERS
@@ -318,10 +351,18 @@ def run_scan():
 
     oversold_count = 0
     buys_this_run = 0
+    total_open_positions = len(held_symbols)
 
     for symbol in watchlist:
         if buys_this_run >= MAX_NEW_BUYS_PER_RUN:
             log.info(f"Reached MAX_NEW_BUYS_PER_RUN ({MAX_NEW_BUYS_PER_RUN}) — stopping scan for this run.")
+            break
+
+        if total_open_positions >= MAX_TOTAL_OPEN_POSITIONS:
+            log.info(
+                f"Reached MAX_TOTAL_OPEN_POSITIONS ({MAX_TOTAL_OPEN_POSITIONS}) — "
+                f"no new buys until an existing position exits."
+            )
             break
 
         try:
@@ -341,7 +382,12 @@ def run_scan():
                 continue
 
             oversold_count += 1
-            log.info(f"{symbol}: RSI {rsi:.2f} — oversold, buying ${ORDER_VALUE_USD} worth.")
+
+            if not passes_trend_filter(closes):
+                log.info(f"{symbol}: RSI {rsi:.2f} (oversold) but below its {TREND_SMA_PERIOD}-day trend — skipping.")
+                continue
+
+            log.info(f"{symbol}: RSI {rsi:.2f}, above {TREND_SMA_PERIOD}-day trend — buying ${ORDER_VALUE_USD} worth.")
 
             buy_order = place_market_buy_notional(symbol, ORDER_VALUE_USD)
             order_id = buy_order.get("id")
@@ -353,9 +399,10 @@ def run_scan():
             if filled:
                 log.info(
                     f"  Filled {filled.get('filled_qty')} @ {filled.get('filled_avg_price')}. "
-                    f"Profit target will be checked on future runs."
+                    f"Profit target / stop loss will be checked on future runs."
                 )
             buys_this_run += 1
+            total_open_positions += 1
 
         except Exception as e:
             # One bad ticker should never take down the whole scan.
