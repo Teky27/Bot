@@ -154,8 +154,14 @@ def calculate_rsi(closes: pd.Series, period: int = RSI_PERIOD) -> float:
 
 def get_sp500_tickers() -> list[str]:
     """Fetches the current S&P 500 constituent list from Wikipedia."""
+    import io
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url)
+    # Wikipedia returns 403 Forbidden to requests without a browser-like
+    # User-Agent header — pandas.read_html doesn't set one by default, so
+    # we fetch the page ourselves first and hand pandas the HTML directly.
+    resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    resp.raise_for_status()
+    tables = pd.read_html(io.StringIO(resp.text))
     tickers = tables[0]["Symbol"].tolist()
     # A handful of tickers use a dot for share class (e.g. BRK.B, BF.B).
     # Yahoo Finance and Alpaca don't always agree on how to format these,
